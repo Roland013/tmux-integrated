@@ -451,11 +451,28 @@ export class TmuxControlClient extends EventEmitter {
         // compatibility with older tmux versions. New windows inherit the
         // session environment set through updateEnvironment.
         void options.env;
-        if (options.shell) {
-            cmd += ` ${shellescape(options.shell)}`;
-        }
+        const tail = options.shell ? ` ${shellescape(options.shell)}` : '';
 
-        const result = await this.sendCommand(cmd);
+        // Create the window after the highest existing index so that tmux window
+        // order matches the order tabs are created in. Left to itself tmux
+        // reuses the lowest free index while VS Code appends the new tab on the
+        // right, so closing one window and opening another silently reordered
+        // the tabs on the next reload.
+        //
+        // Both steps are best-effort. The index is read in a separate command,
+        // so another client — a second VS Code window on the same session, or
+        // the user in a shell — can claim it in between, and `new-window -t` on
+        // a taken index is an error. Falling back to an unplaced window is much
+        // better than failing to open the terminal at all.
+        const appendAt = await this.trailingWindowIndex().catch(() => undefined);
+
+        let result: string[] | undefined;
+        if (appendAt !== undefined) {
+            result = await this.sendCommand(`${cmd} -t ${appendAt + 1}${tail}`).catch(() => undefined);
+        }
+        if (result === undefined) {
+            result = await this.sendCommand(`${cmd}${tail}`);
+        }
         const parts = (result[0] ?? '').trim().split(' ');
         if (parts.length < 3 || !parts[0].startsWith('@') || !parts[1].startsWith('%')) {
             throw new Error(`Unexpected new-window response: ${result[0] ?? '(empty)'}`);
@@ -514,6 +531,15 @@ export class TmuxControlClient extends EventEmitter {
 
     async killWindow(windowId: string): Promise<void> {
         await this.sendCommand(`kill-window -t ${windowId}`);
+    }
+
+    /** Highest `#{window_index}` in the session, or undefined if none is known. */
+    private async trailingWindowIndex(): Promise<number | undefined> {
+        const windows = await this.listWindows();
+        if (windows.length === 0) {
+            return undefined;
+        }
+        return windows.reduce((highest, w) => (w.index > highest ? w.index : highest), 0);
     }
 
     async listWindows(): Promise<TmuxWindow[]> {

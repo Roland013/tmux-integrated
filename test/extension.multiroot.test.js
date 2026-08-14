@@ -48,6 +48,8 @@ class FakeTmuxControlClient extends events.EventEmitter {
   }
 
   async updateEnvironment() {}
+
+  disconnect() {}
 }
 
 test('uses the selected workspace folder as a new tmux terminal cwd', async () => {
@@ -90,6 +92,8 @@ test('uses the selected workspace folder as a new tmux terminal cwd', async () =
       onDidOpenTerminal: () => new Disposable(),
       onDidCloseTerminal: () => new Disposable(),
       onDidChangeActiveTerminal: () => new Disposable(),
+      onDidChangeWindowState: () => new Disposable(),
+      state: { focused: false },
     },
     commands: { registerCommand: () => new Disposable() },
   };
@@ -122,12 +126,14 @@ test('uses the selected workspace folder as a new tmux terminal cwd', async () =
     return originalLoad(request, parent, isMain);
   };
 
+  const subscriptions = [];
   try {
     const extension = require('../out/extension.js');
     await extension.activate({
       extensionPath: '/extension',
       globalStorageUri: { fsPath: '/extension-storage' },
-      subscriptions: [],
+      workspaceState: { get: (_key, fallback) => fallback, update: async () => {} },
+      subscriptions,
     });
     assert.ok(profileProvider, 'profile provider was registered');
 
@@ -135,6 +141,9 @@ test('uses the selected workspace folder as a new tmux terminal cwd', async () =
 
     assert.equal(profile.options.pty.startDirectory, '/workspace/Applications');
   } finally {
+    for (const subscription of subscriptions) {
+      subscription.dispose?.();
+    }
     Module._load = originalLoad;
     delete require.cache[require.resolve('../out/extension.js')];
   }

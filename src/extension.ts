@@ -19,6 +19,7 @@ import { execFileSync } from 'child_process';
 
 import { TmuxControlClient, CommandFlags } from './tmuxControlClient';
 import { TmuxTerminal } from './tmuxTerminalProvider';
+import { pickTerminalTabTitle } from './windowTitle';
 
 interface AttachWindowItem extends vscode.QuickPickItem {
     windowId: string;
@@ -64,6 +65,35 @@ const terminalPtyByTerminal = new Map<vscode.Terminal, TmuxTerminal>();
 const pendingTerminalPtys: TmuxTerminal[] = [];
 let activeTmuxWindowId: string | null = null;
 let pendingUserTerminalFocus: boolean = false;
+
+
+/**
+ * The tab label this extension last saw, per terminal.
+ *
+ * VS Code updates `Terminal.name` from `onDidChangeName` only after a renderer
+ * round trip, so this records the last label observed on the terminal while
+ * emitted titles are tracked separately. See syncTerminalName.
+ */
+const lastKnownTabName = new WeakMap<vscode.Terminal, string>();
+
+/** Per-terminal subscription recording titles this extension emits. */
+const emittedNameSubscriptions = new Map<vscode.Terminal, vscode.Disposable>();
+
+/**
+ * Titles emitted for a terminal that the tab has not reported back yet.
+ *
+ * A title we emit reaches `Terminal.name` only after a round trip through the
+ * renderer, so it cannot be recorded as the tab's label at the moment we send
+ * it: until the trip completes `terminal.name` still holds the *previous*
+ * label, and treating that as a rename pushes the stale name back to tmux with
+ * `automatic-rename off`. Instead the title is parked here and matched when it
+ * arrives, so a tab label that is neither the last known one nor a title we
+ * sent is what identifies a rename the user made.
+ */
+const pendingEmittedNames = new WeakMap<vscode.Terminal, string[]>();
+
+/** Cap on parked titles, so a busy terminal cannot grow the list without end. */
+const MAX_PENDING_EMITTED_NAMES = 32;
 
 // ---------------------------------------------------------------------------
 // Activation / deactivation
@@ -120,11 +150,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     //   - `terminal.integrated.defaultProfile.<os>` === `tmux-integrated`
     //     (so users who deliberately mix profiles are never affected)
     //
-    // Any tab that does not look like one of ours (`tmux` or `tmux:N`)
-    // is treated as a stray when both gates are satisfied. Restored
-    // tmux-backed tabs go through `provideTerminalProfile` and acquire
-    // a TmuxTerminal pty, so they are never disposed here.
-    const stray = vscode.window.terminals.filter((t) => !looksLikeTmuxTerminal(t));
+    // A stray is a terminal the workbench spawned from a shell profile, so
+    // the test is whether anything owns a Pseudoterminal for it — never what
+    // the tab is called. Titles follow the tmux window name, so a tab reading
+    // "zsh" or "deploy watch" is routine; treating those as strays would
+    // dispose them, and TmuxTerminal.close() answers that with kill-window.
+    const stray = vscode.window.terminals.filter((t) => !isExtensionOwnedTerminal(t));
     if (stray.length > 0) {
         const cfgRoot = vscode.workspace.getConfiguration('tmux-integrated');
         const closeStray = cfgRoot.get<boolean>('closeStrayShellsOnActivation', true);
@@ -164,7 +195,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 }
 
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
+    // A window reload is exactly when an unsynced built-in rename would be
+    // lost, so push pending names to tmux before the control client closes.
+    await flushRenames();
     disposing = true;
     terminalPtyByTerminal.clear();
     pendingTerminalPtys.length = 0;
@@ -177,7 +211,9 @@ export function deactivate(): void {
 function registerTerminalRenameSync(context: vscode.ExtensionContext): void {
     const trackTerminal = (terminal: vscode.Terminal): TmuxTerminal | null => {
         let pty = terminalPtyByTerminal.get(terminal) ?? getTmuxPtyFromTerminal(terminal);
-        if (!pty && looksLikeTmuxTerminal(terminal)) {
+        if (!pty && isExtensionOwnedTerminal(terminal)) {
+            // creationOptions did not carry the pty through; fall back to the
+            // one we queued when this terminal's options were built.
             pty = takeNextPendingTerminalPty();
         }
         if (!pty) {
@@ -185,18 +221,35 @@ function registerTerminalRenameSync(context: vscode.ExtensionContext): void {
         }
 
         terminalPtyByTerminal.set(terminal, pty);
+        if (!lastKnownTabName.has(terminal)) {
+            lastKnownTabName.set(terminal, terminal.name);
+        }
+        if (!emittedNameSubscriptions.has(terminal)) {
+            // VS Code assigns Terminal.name from every pty title change, but
+            // only after a round trip through the renderer. Record the value
+            // as we emit it, so the one that comes back is not mistaken for a
+            // rename the user made — which would otherwise turn tmux's
+            // automatic-rename off on the first title the window reports.
+            emittedNameSubscriptions.set(terminal, pty.onDidChangeName((name) => {
+                const pending = pendingEmittedNames.get(terminal) ?? [];
+                pending.push(name);
+                if (pending.length > MAX_PENDING_EMITTED_NAMES) {
+                    pending.splice(0, pending.length - MAX_PENDING_EMITTED_NAMES);
+                }
+                pendingEmittedNames.set(terminal, pending);
+            }));
+        }
         // Detect built-in "Rename…" the instant the user types in this terminal.
         pty.setOnInputCallback(() => {
-            const lastEmitted = pty!.getLastEmittedName();
-            if (lastEmitted !== null && terminal.name !== lastEmitted) {
-                void pty!.syncNameToTmux(terminal.name);
-            }
+            void syncTerminalName(terminal);
         });
         return pty;
     };
 
     const untrackTerminal = (terminal: vscode.Terminal): void => {
         terminalPtyByTerminal.delete(terminal);
+        emittedNameSubscriptions.get(terminal)?.dispose();
+        emittedNameSubscriptions.delete(terminal);
     };
 
     const syncActiveTerminalToTmuxWindow = async (terminal: vscode.Terminal | undefined): Promise<void> => {
@@ -228,16 +281,86 @@ function registerTerminalRenameSync(context: vscode.ExtensionContext): void {
         vscode.window.onDidOpenTerminal((terminal) => {
             trackTerminal(terminal);
             // VS Code may not focus terminal when it is opened
-            if(pendingUserTerminalFocus && looksLikeTmuxTerminal(terminal)) {
+            if (pendingUserTerminalFocus && isTmuxTerminal(terminal)) {
                 terminal.show();
                 pendingUserTerminalFocus = false;
             }
         }),
-        vscode.window.onDidCloseTerminal(untrackTerminal),
+        vscode.window.onDidCloseTerminal((terminal) => {
+            // Catch a rename made just before the tab was closed.
+            void syncTerminalName(terminal);
+            untrackTerminal(terminal);
+        }),
         vscode.window.onDidChangeActiveTerminal((terminal) => {
+            void flushRenames();
             void syncActiveTerminalToTmuxWindow(terminal);
         }),
+        // Losing window focus is the last reliable moment before a reload.
+        vscode.window.onDidChangeWindowState(() => {
+            void flushRenames();
+        }),
     );
+}
+
+/**
+ * Push a built-in "Rename…" to tmux.
+ *
+ * VS Code has no terminal-rename event — `@types/vscode` offers only
+ * `onDidChangeTerminalState` and `onDidChangeTerminalShellIntegration` — so a
+ * rename has to be spotted by watching `terminal.name`.
+ *
+ * The comparison is against the label this extension last observed on the tab,
+ * while titles emitted by the pty are parked until VS Code applies them after
+ * its renderer round trip. Treating an emitted title as immediately applied
+ * makes the still-stale `Terminal.name` look like a user rename and writes it
+ * over the tmux window's real name — which is how windows ended up called
+ * `tmux:<index>`.
+ */
+async function syncTerminalName(terminal: vscode.Terminal): Promise<void> {
+    const pty = terminalPtyByTerminal.get(terminal);
+    if (!pty) {
+        return;
+    }
+    const lastKnown = lastKnownTabName.get(terminal);
+    if (lastKnown === undefined) {
+        lastKnownTabName.set(terminal, terminal.name);
+        return;
+    }
+    if (terminal.name === lastKnown) {
+        // Unchanged. This is also the state during the round trip for a title
+        // we just emitted: the tab still shows the previous label, and syncing
+        // it would push a stale name back over the one tmux just set.
+        return;
+    }
+
+    const pending = pendingEmittedNames.get(terminal);
+    const arrived = pending ? pending.indexOf(terminal.name) : -1;
+    if (arrived !== -1) {
+        // The tab is reporting a title this extension emitted, not a rename.
+        // Drop it and anything older the workbench coalesced past.
+        pending!.splice(0, arrived + 1);
+        lastKnownTabName.set(terminal, terminal.name);
+        return;
+    }
+
+    // The label changed to something never emitted here — a built-in "Rename…".
+    pendingEmittedNames.delete(terminal);
+    lastKnownTabName.set(terminal, terminal.name);
+    if (isPlaceholderTabName(terminal.name)) {
+        // `tmux` / `tmux:<n>` is only ever this extension's own placeholder,
+        // never a name a user chose, so it must never reach tmux.
+        return;
+    }
+    await pty.syncNameToTmux(terminal.name);
+}
+
+/** A tab label this extension invented, as opposed to one the user chose. */
+function isPlaceholderTabName(name: string): boolean {
+    return /^tmux(:\d+)?$/.test(name.trim());
+}
+
+async function flushRenames(): Promise<void> {
+    await Promise.all([...terminalPtyByTerminal.keys()].map((t) => syncTerminalName(t)));
 }
 
 function getTmuxPtyFromTerminal(terminal: vscode.Terminal): TmuxTerminal | null {
@@ -249,8 +372,21 @@ function getTmuxPtyFromTerminal(terminal: vscode.Terminal): TmuxTerminal | null 
     return pty instanceof TmuxTerminal ? pty : null;
 }
 
-function looksLikeTmuxTerminal(terminal: vscode.Terminal): boolean {
-    return terminal.name === 'tmux' || terminal.name.startsWith('tmux:');
+/**
+ * True when the terminal is driven by a `Pseudoterminal` rather than a process
+ * the workbench spawned. Deliberately not `instanceof TmuxTerminal`: for the
+ * stray-shell sweep the question is only "did an extension create this", and
+ * disposing another extension's terminal would be just as wrong as disposing
+ * one of ours.
+ */
+function isExtensionOwnedTerminal(terminal: vscode.Terminal): boolean {
+    const options = terminal.creationOptions as vscode.TerminalOptions | vscode.ExtensionTerminalOptions;
+    return !!options && 'pty' in options;
+}
+
+/** True when this terminal is backed by one of our tmux ptys. */
+function isTmuxTerminal(terminal: vscode.Terminal): boolean {
+    return terminalPtyByTerminal.has(terminal) || getTmuxPtyFromTerminal(terminal) !== null;
 }
 
 function registerPendingTerminalPty(pty: TmuxTerminal): void {
@@ -483,6 +619,9 @@ async function ensureClientConnectedImpl(startDirectory: string): Promise<boolea
             log(`Existing session — found ${windows.length} window(s) to adopt`);
             // Carry name + automaticRename through so TmuxTerminal.open()
             // does not need fresh round-trips on a high-latency link.
+            // list-windows returns windows in index order, and tabs are
+            // created in that same order, so tmux window order is the tab
+            // order. newWindow() keeps it that way by appending.
             windowsToAdopt = windows.map(w => ({
                 windowId: w.id,
                 paneId: w.paneId,
@@ -547,7 +686,9 @@ function buildTerminalOptions(
     registerPendingTerminalPty(pty);
 
     return {
-        name: existingWindow?.windowIndex !== undefined ? `tmux:${existingWindow.windowIndex}` : 'tmux',
+        // Whatever label the tab is created with is the label it keeps, so name
+        // it after the tmux window rather than an index-derived placeholder.
+        name: pickTerminalTabTitle(existingWindow?.name, existingWindow?.windowIndex),
         pty,
     };
 }
@@ -855,7 +996,7 @@ async function autoConnectExistingSession(): Promise<void> {
     // is still something to adopt — otherwise the listener does nothing
     // and we exit on the initial grace.
     disposable = vscode.window.onDidOpenTerminal((terminal) => {
-        if (windowsToAdopt.length > 0 && looksLikeTmuxTerminal(terminal)) {
+        if (windowsToAdopt.length > 0 && isTmuxTerminal(terminal)) {
             armTimer(AUTO_CONNECT_QUIET_GRACE_MS, 'quiet grace expired after VS Code restore');
         }
     });

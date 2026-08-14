@@ -39,6 +39,9 @@ continue where you left off.
   VS Code terminal, so there are no mouse or scrolling issues.
 - **Status bar item** — shows the active session name; click to pick an
   existing window.
+- **Tab titles follow tmux** — a tab shows its tmux window name, and renaming
+  from either side keeps both in step. See
+  [Tab titles and window order](#tab-titles-and-window-order).
 
 ## Requirements
 
@@ -187,6 +190,35 @@ Every release also attaches a `.vsix` to its
 |---|---|
 | `tmux: New tmux Terminal` | Open a new terminal backed by a new tmux window |
 | `tmux: Attach to tmux Window` | Pick an existing tmux window from the session |
+
+## Tab titles and window order
+
+**Titles.** A tab shows its tmux window name. While tmux's `automatic-rename`
+is on — the default for a new window — that name tracks the foreground process
+(`zsh`, `nvim`, `git`, …) and the tab follows along. Rename a window and tmux
+turns `automatic-rename` off, so your name sticks.
+
+Renaming works from either side and is synced both ways: VS Code's built-in
+**Rename…**, the **tmux: Rename Terminal** command, and `rename-window` from
+inside tmux all end up in the same place. The extension never renames a window
+on your behalf, so nothing it invents is persisted into your session.
+
+**Order.** Tabs follow tmux window order, so a reload reproduces your layout.
+New windows are created after the highest existing index rather than filling a
+freed one, which is what keeps that order stable when you close a window and
+open another.
+
+To reorder deliberately, reorder in tmux and the tabs follow on the next reload:
+
+```bash
+tmux swap-window -s mysession:3 -t mysession:1
+tmux move-window  -s mysession:4 -t mysession:0
+```
+
+Dragging a terminal tab in VS Code cannot be persisted. VS Code exposes no API
+for terminal tab position — a `Terminal` has no index and there is no reorder
+event — so no extension can observe a drag, and the order reverts on the next
+reload.
 
 ## How it works
 
