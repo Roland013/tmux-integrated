@@ -167,6 +167,23 @@ There are three doorways into "create a VS Code terminal tab":
    `windowsToAdopt` snapshot and creates one VS Code terminal per remaining
    window via `vscode.window.createTerminal(buildTerminalOptions(w))`.
 
+**tmux window order is the tab order.** `list-windows` returns windows by
+index, tabs are created in that same sequence, so a reload reproduces the
+layout. To reorder deliberately, reorder in tmux (`swap-window`, `move-window`)
+and the tabs follow on the next reload.
+
+Keeping that true requires one thing of window creation: `newWindow()` creates
+each window *after* the highest existing index. Left to itself tmux reuses the
+lowest free index while VS Code appends the new tab on the right, so closing one
+window and opening another silently reordered the tabs on the next reload.
+
+There is deliberately no VS Code-side order store. VS Code exposes no API for
+terminal tab position — no index on `Terminal`, no reorder event, and
+`window.terminals` is creation-ordered rather than visually ordered — so an
+extension cannot observe a tab the user drags, and therefore cannot restore one.
+Persisting a VS Code-side order would only ever record creation order under a
+second source of truth that tmux could contradict.
+
 In a **multi-root workspace**, paths that create a *genuinely new* tmux
 window (`provideTerminalProfile` falling through to `newWindow`, and the
 `newTerminal` command) first show a quick-pick over the workspace folders
@@ -195,10 +212,7 @@ open(initialDimensions)
   |     * else: client.newWindow(...)  (creation path)
   |-- record windowId, paneId, tabWindowIndex
   |-- subscribe: 'output' / 'window-close' / 'window-renamed' / 'tmux-exit'
-  |-- query #{automatic-rename}, decide tab label (pickTerminalTabTitle)
-  |-- set-option -w automatic-rename off
-  |-- emit initial tab name
-  |-- if (current name in tmux ≠ chosen label) → rename-window
+  |-- emit initial tab name from #{window_name} (pickTerminalTabTitle)
   |-- resizeWindowForClient(initialDimensions)
   |-- if adoption: capture-pane snapshot + restore cursor position
 ```
@@ -220,27 +234,89 @@ explicitly preserved so they can be re-adopted next launch.
 
 ## Tab title model (`windowTitle.ts`)
 
-A tmux window has both a `#{window_name}` and an `#{automatic-rename}` flag.
-When automatic-rename is on, tmux owns the title (it changes to whatever
-process is in the foreground — `zsh`, `bash`, `vim`, …). When it is off, the
-current name is treated as intentional (set by user or by us) and shown
-verbatim.
+tmux owns the window name and the tab simply shows it:
 
 ```text
-automatic-rename=on  → label = "tmux:<window_index>"
-automatic-rename=off, name non-empty → label = name
-automatic-rename=off, name empty     → label = "tmux:<window_index>"
+name non-empty → label = name
+name empty     → label = "tmux:<window_index>"   (VS Code side only)
 ```
 
-After we settle on a label in `open()`, the extension immediately turns
-automatic-rename off and (if needed) issues `rename-window` so tmux's notion
-of the title matches what VS Code shows.
+While `#{automatic-rename}` is on that name tracks the foreground process
+(`zsh`, `nvim`, `git`, …) and `%window-renamed` keeps the tab in step. Once
+the user renames a window — from VS Code, or with `rename-window` inside tmux —
+tmux turns automatic-rename off and the chosen name sticks.
+
+`open()` never renames the window. It used to disable automatic-rename and
+write its own `tmux:<window_index>` placeholder back with `rename-window`,
+which persisted an index-derived string as the window's permanent name; that
+name then went stale as soon as tmux indices shifted.
 
 The bidirectional rename sync works as follows:
 
-* **VS Code → tmux**: a built-in "Rename…" mutates `terminal.name`. The
-  `setOnInputCallback` keystroke probe in `extension.ts` notices the
-  divergence and calls `pty.syncNameToTmux(newName)`.
+* **VS Code → tmux**: a built-in "Rename…" mutates `terminal.name`, and VS Code
+  raises no event for it — `@types/vscode` offers only
+  `onDidChangeTerminalState` and `onDidChangeTerminalShellIntegration`. So
+  `syncTerminalName()` in `extension.ts` spots it by watching `terminal.name`.
+  It runs from the keystroke probe, the active-terminal, close and window-focus
+  events, and `deactivate()` — the keystroke probe alone lost any rename that
+  was not followed by typing.
+
+  **The comparison is against the label this extension last saw on the tab
+  (`lastKnownTabName`), never against the name the pty emitted.** VS Code does
+  assign `Terminal.name` from a pty title change, but only after a round trip:
+  `onDidChangeName` becomes a `title` property change, and
+  `$acceptTerminalTitleChange` assigns it back on the extension-host side.
+  Comparing against the emitted name reports a rename on every tab whose
+  creation label differs from the window name, and writes that label over the
+  tmux window's real name — which is how windows ended up called `tmux:<index>`.
+
+  A title this extension emits is parked in `pendingEmittedNames` until the tab
+  reports it back, and matched there when it arrives. It cannot simply be
+  recorded as the tab's label at the moment it is sent: until the round trip
+  completes `terminal.name` still holds the *previous* label, so a sync landing
+  inside that gap would push the stale name back over the one tmux just set —
+  with `automatic-rename off` attached, switching off exactly the tracking the
+  tab is meant to follow. The three outcomes are therefore:
+
+  * `terminal.name` equals the last known label — nothing changed, and this is
+    also what the in-flight gap looks like.
+  * `terminal.name` matches a parked title — the workbench applied something we
+    emitted; drop it and anything older it coalesced past.
+  * `terminal.name` is neither — the label became something this extension never
+    emitted, which is a built-in "Rename…" and the only case that reaches tmux.
+
+  That last case still fires while a title is in flight, so a rename made during
+  the gap is not swallowed.
+
+  One further guard backs it up: a name matching `^tmux(:\d+)?$` is never
+  written to tmux, since that string is only ever this extension's own
+  placeholder.
+
+  `buildTerminalOptions` also names the tab after the tmux window rather than
+  after its index, so an adopted tab reads `deploy watch` instead of `tmux:2`
+  and there is usually no mismatch to resolve at all.
+
+**A failed attach never kills the window.** `open()` records `windowId` before
+it seeds scrollback, so a `capture-pane` or cursor-lookup failure leaves a fully
+initialised id behind and closes the tab. For a window this tab *created* that
+is correct cleanup — it holds nothing. For an adopted window it is destruction:
+the window pre-existed the tab and is still running the user's work, so
+`adoptionFailed` suppresses the `kill-window` that `close()` would otherwise
+send.
+
+**Terminal identity is never taken from the title.** Because titles follow the
+tmux window name, a tmux-backed tab can be called anything. The stray-shell
+sweep asks `isExtensionOwnedTerminal()` — does anything own a `Pseudoterminal`
+for this tab — and focus and adoption-grace ask `isTmuxTerminal()`. Deciding
+from the title would classify a tab called `zsh` as a stray shell and dispose
+it, and `close()` answers a dispose with `kill-window`.
+
+  This is also why `open()` may not rename the window. The old write-back was
+  load bearing: renaming the tmux window to the tab's placeholder kept both
+  sides in agreement, so a comparison against the emitted name could not fire.
+  Removing it without fixing the comparison turns every adopted tab into a
+  `rename-window -t <id> tmux:<index>` the moment anything triggers a sync.
+
 * **tmux → VS Code**: `%window-renamed` notifications are processed by
   `windowRenamedListener` and emitted to VS Code via `onDidChangeName`.
 * **Explicit command**: `tmux-integrated.renameTerminal` calls
@@ -321,20 +397,20 @@ Three things compound:
 
 ### "Tabs get renamed to 'zsh' or 'bash' on reconnect"
 
-`TmuxTerminal.open()` registers `windowRenamedListener` early (correct —
-we mustn't drop events) and only later issues `set-option -w
-automatic-rename off`. tmux can emit `%window-renamed @id zsh` from its own
-automatic-rename feature in the gap between those two steps. The listener
-processed those events as if they were intentional renames, so the VS Code
-tab title became "zsh" / "bash" / whatever the foreground process happened
-to be. The race window is sub-millisecond locally but seconds-wide over a
-laggy SSH tunnel.
+For a window the user never named this is now the intended behaviour: tmux's
+automatic-rename owns the name and the tab follows it (see *Tab title model*).
+
+The bug underneath was narrower. `TmuxTerminal.open()` registers
+`windowRenamedListener` early — correct, we mustn't drop events — so a
+`%window-renamed` arriving while `open()` was still settling could be applied
+and then overwritten by the older name `open()` started with. That gap is
+sub-millisecond locally but seconds wide over a laggy SSH tunnel.
 
 *Mitigations:*
 
 * An `initialNameCommitted` guard suppresses the listener until `open()`
-  has settled the title. After commit the listener works normally so
-  user-initiated `rename-window` from inside tmux still updates the tab.
+  has settled the title. After commit the listener works normally, which is
+  what keeps the tab in step with both automatic-rename and user renames.
 * `name` and `automaticRename` are now propagated all the way from
   `listWindows()` into `existingWindow`, so on reconnect we don't need a
   fresh round-trip just to find out what the window is called.

@@ -1,12 +1,16 @@
 /**
  * VS Code terminal tab titles from tmux `#{window_name}`.
  *
- * When tmux's per-window **automatic-rename** option is on, the title is still
- * owned by tmux (shell / cwd / format) — we normalize those to `tmux:&lt;n&gt;`
- * and sync with `rename-window`. When automatic-rename is off, the current
- * name is treated as intentional (user or this extension) and shown as-is.
+ * tmux owns the window name, so the tab simply shows it. While
+ * **automatic-rename** is on that name tracks the foreground process
+ * (`zsh` → `nvim` → `git`) and the tab follows along; once the user renames
+ * a window — from VS Code or with `rename-window` inside tmux — tmux turns
+ * automatic-rename off and the chosen name sticks.
  *
- * This avoids maintaining a list of shell names; tmux already encodes “auto vs fixed”.
+ * The extension never renames a window on the user's behalf, so no
+ * extension-invented label is ever persisted into the tmux session.
+ * `tmux:<n>` remains only as a VS Code-side placeholder for the rare window
+ * that has no name at all.
  */
 
 /** Interpret `#{automatic-rename}` / `list-windows` field (version-dependent values). */
@@ -18,16 +22,11 @@ export function tmuxAutomaticRenameIsOn(value: string | undefined): boolean {
 /**
  * @param windowName current `#{window_name}`
  * @param windowIndex zero-based `#{window_index}`
- * @param automaticRename whether tmux is still auto-renaming this window
  */
 export function pickTerminalTabTitle(
     windowName: string | undefined,
     windowIndex: number | undefined,
-    automaticRename: boolean | undefined,
 ): string {
-    if (automaticRename === true) {
-        return windowIndex !== undefined ? `tmux:${windowIndex}` : 'tmux';
-    }
     const raw = windowName?.trim();
     if (raw) {
         return raw;
